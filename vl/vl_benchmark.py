@@ -6,17 +6,21 @@ import time
 import queue
 import base64
 import json  # 添加导入json模块
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
+
+OUTPUT_TOKENS = 512  # 输出的token数
 # 配置
-TOTAL_REQUESTS = 80      # 总请求数
-CONCURRENCY = [2, 4, 8, 16, 20, 24, 28, 32, 36, 40, 48, 64]  # 并发线程数数组
-API_URL = "http://192.168.8.41:8000/v1/chat/completions"  # vLLM OpenAI API 地址
+REQUEST_PER_CONCURRENCY = 10  # 每个并发线程的请求数
+CONCURRENCY = [1, 2, 4, 8, 16, 20, 24, 28, 32, 36, 40, 48, 64, 80]  # 并发线程数数组
+API_URL = "http://192.168.8.53:1025/v1/chat/completions"  # vLLM OpenAI API 地址
 REQUEST_TIMEOUT =3600     # 单次请求超时（秒）
-IMAGE_PATH = "pics"  # 测试图片路径
+IMAGE_PATH = "data/pics"  # 测试图片路径
 PROMPT = "详细描述这张图片的内容，要求输出在500个字以上，尽量详细！"  # 分析图片的提示词
 MODEL_NAME = "Qwen2.5-VL-7B-Instruct"  # 模型名称
+# MODEL_NAME = "Qwen2.5-VL-32B-Instruct-int8"
+
+RESULT_FILE = "results.md"  # 测试结果文件
 
 # 全局统计
 success_count = 0
@@ -64,19 +68,23 @@ def build_payload(image_base64: str, stream: bool = False) -> dict:
                 ]
             }
         ],
-        "max_tokens": 512,
+        "max_tokens": OUTPUT_TOKENS,
+        "min_tokens": OUTPUT_TOKENS,
         "stream": stream
     }
     if stream:
         payload["stream_options"] = {"include_usage": True}
     return payload
 
-def worker(worker_id: int, image_base64: str, stream: bool = True):
+def worker(worker_id: int, image_paths: list[str], stream: bool = True):
     """工作线程：发送图片分析请求"""
     global success_count, failed_count, total_latency, total_tokens, abnormal_count, first_token_latency
     while not request_queue.empty():
         try:
             req_id = request_queue.get_nowait()
+            # 随机读取一张图片
+            random_image_path = random.choice(image_paths)
+            image_base64_for_request = encode_image_to_base64(random_image_path)
         except queue.Empty:
             break
 
@@ -84,7 +92,7 @@ def worker(worker_id: int, image_base64: str, stream: bool = True):
         try:
             with requests.post(
                 API_URL,
-                json=build_payload(image_base64, stream),
+                json=build_payload(image_base64_for_request, stream), # Use image_base64_for_request
                 timeout=REQUEST_TIMEOUT,
                 stream=stream  # 启用流式响应
             ) as response:
@@ -98,7 +106,7 @@ def worker(worker_id: int, image_base64: str, stream: bool = True):
                                 first_chunk_time = time.time()  # 记录首token时间
                             chunk = chunk.decode('utf-8').strip("data: ")
                             try:
-                                print(f"Thread-{worker_id}-{req_id} | {chunk}")
+                                # print(f"Thread-{worker_id}-{req_id} | {chunk}")
                                 chunk_json = json.loads(chunk)
                                 chunk_choices = chunk_json.get("choices", [])
                                 if chunk_choices:
@@ -114,7 +122,7 @@ def worker(worker_id: int, image_base64: str, stream: bool = True):
 
                         # 将所有块拼接为完整响应
                         content = "".join(content_chunks)
-                        tokens = completion_tokens if completion_tokens>0 else len(content_chunks)
+                        tokens = completion_tokens if completion_tokens > 0 else len(content_chunks)
                         
                         with glock:
                             success_count += 1
@@ -143,6 +151,8 @@ def worker(worker_id: int, image_base64: str, stream: bool = True):
                         failed_count += 1
                     print(f"[失败]Thread-{worker_id}-{req_id} | "
                           f"状态码: {response.status_code} | 响应: {response.text}")
+        except json.JSONDecodeError as e:
+            pass
         except Exception as e:
             with glock:
                 failed_count += 1
@@ -155,18 +165,19 @@ def run_test(stream: bool = True):
     image_paths = get_image_paths_from_directory(IMAGE_PATH)
     print(f"已加载 {len(image_paths)} 张图片用于测试\n")
     
-    with open("test_results.md", "w+") as f:
+    with open(RESULT_FILE, "w+") as f:
         f.write("# 测试结果\n\n")
-        f.write("| 并发数 | 请求数 | 存疑请求数 | 总token输出 | 每图片平均耗时(s) | 首token耗时(s) | token处理速度 | QPS |\n")
-        f.write("|--------|--------|--------|-------------|------------------|---------------|----------------|-----|\n")
+        f.write("| 并发数 | 请求数 | 存疑请求数 | 总token输出 | 总耗时(s) | 平均token输出 | 平均耗时(s) | 首token延迟范围(s) | 平均首token延迟(s) | token处理速度 | QPS |\n")
+        f.write("|--------|--------|----------|-------------|----------|--------------|-------------|-------------------|-------------------|--------------|-----|\n")
     
     for concurrency in CONCURRENCY:
+        total_requests = REQUEST_PER_CONCURRENCY * concurrency
         # 初始化任务队列
-        for i in range(1, TOTAL_REQUESTS + 1):
+        for i in range(1, total_requests + 1):
             request_queue.put(i)
 
         print(f"=== 测试并发数: {concurrency} ===")
-        print(f"总请求数: {TOTAL_REQUESTS} | 并发数: {concurrency}\n")
+        print(f"总请求数: {total_requests} | 并发数: {concurrency}\n")
 
         global success_count, failed_count, total_latency, total_tokens, abnormal_count, first_token_latency
         success_count = 0
@@ -179,10 +190,8 @@ def run_test(stream: bool = True):
         start_time = time.time()
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             for i in range(concurrency):
-                # 随机选择一张图片进行测试
-                random_image_path = random.choice(image_paths)
-                image_base64 = encode_image_to_base64(random_image_path)
-                executor.submit(worker, i + 1, image_base64, stream)
+                # 提交工作线程
+                executor.submit(worker, i + 1, image_paths, stream)
         
         # 统计结果
         with glock:
@@ -197,15 +206,18 @@ def run_test(stream: bool = True):
         print(f"成功请求: {success_count} | 失败请求: {failed_count} | 存疑请求: {abnormal_count}")
         print(f"总耗时: {total_time:.2f} 秒")
         print(f"平均耗时: {avg_latency:.2f} 秒")
+        print(f"首token延迟范围: {min(first_token_latency):.2f} - {max(first_token_latency):.2f} 秒")
         print(f"平均首token延迟: {avg_first_token_latency:.2f} 秒")
-        print(f"总tokens: {total_tokens:.2f}")
+        print(f"总tokens: {total_tokens}")
         print(f"平均生成 Tokens: {avg_tokens:.1f}")
         print(f"token 速度: {vtok:.2f}\n")
         print(f"QPS: {qps:.5f} (请求/秒)")
         
-        with open("test_results.md", "a") as f:
-            f.write(f"| {concurrency} | {TOTAL_REQUESTS} | {abnormal_count} | {total_tokens:.2f} | "
-                    f"{avg_latency:.2f} | {avg_first_token_latency:.2f} | "
+        with open(RESULT_FILE, "a") as f:
+            f.write(f"| {concurrency} | {total_requests} | {abnormal_count} | {total_tokens} | "
+                    f"{total_time:.2f} | {avg_tokens:.2f} | "
+                    f"{avg_latency:.2f} | {min(first_token_latency):.2f} - {max(first_token_latency):.2f} | "
+                    f"{avg_first_token_latency:.2f} | "
                     f"{vtok:.2f} | {qps:.5f} |\n")
             f.flush()
 
